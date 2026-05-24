@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import loadDynamic from 'next/dynamic'
 import {
   Button, Card, Modal, Input, Form, Switch, Tag,
@@ -10,6 +10,8 @@ import {
   PlusOutlined, ThunderboltOutlined, CheckSquareOutlined, LinkOutlined,
 } from '@ant-design/icons'
 import type { DropResult } from '@hello-pangea/dnd'
+import { createClient } from '@/lib/supabase/client'
+import { useWorkspaceStore } from '@/store/workspace.store'
 
 const DragStepList = loadDynamic(() => import('@/components/checklist/DragStepList'), { ssr: false })
 
@@ -21,6 +23,7 @@ interface Step {
   description: string
   is_required: boolean
   link_url?: string
+  order: number
 }
 
 interface Template {
@@ -29,50 +32,60 @@ interface Template {
   steps: Step[]
 }
 
-const mockTemplates: Template[] = [
-  {
-    id: 't1',
-    name: '기본 온보딩 템플릿',
-    steps: [
-      { id: 's1', title: '계정 설정 완료', description: '프로필 사진, 이름, 비밀번호를 설정합니다', is_required: true },
-      { id: 's2', title: '팀원 초대', description: '함께 사용할 팀원을 최소 1명 초대합니다', is_required: true },
-      { id: 's3', title: '첫 프로젝트 생성', description: '실제 업무에 사용할 프로젝트를 만들어봅니다', is_required: true },
-      { id: 's4', title: '연동 설정', description: 'Slack, GitHub 등 자주 사용하는 툴과 연동합니다', is_required: false },
-      { id: 's5', title: '알림 설정', description: '중요한 알림을 놓치지 않도록 알림 설정을 완료합니다', is_required: false },
-    ],
-  },
-  {
-    id: 't2',
-    name: '엔터프라이즈 온보딩',
-    steps: [
-      { id: 'e1', title: 'SSO 설정', description: '회사 계정으로 로그인할 수 있도록 SSO를 연동합니다', is_required: true },
-      { id: 'e2', title: '권한 정책 설정', description: '팀별 접근 권한을 설정합니다', is_required: true },
-      { id: 'e3', title: '보안 감사 로그 활성화', description: '모든 활동이 기록되도록 설정합니다', is_required: true },
-    ],
-  },
-]
-
 export default function ChecklistsPage() {
-  const [templates, setTemplates] = useState<Template[]>(mockTemplates)
-  const [selectedTemplate, setSelectedTemplate] = useState<Template>(mockTemplates[0])
+  const workspace = useWorkspaceStore((s) => s.currentWorkspace)
+  const [templates, setTemplates] = useState<Template[]>([])
+  const [selectedTemplate, setSelectedTemplate] = useState<Template | null>(null)
   const [aiModalOpen, setAiModalOpen] = useState(false)
   const [addStepModalOpen, setAddStepModalOpen] = useState(false)
+  const [addTemplateModalOpen, setAddTemplateModalOpen] = useState(false)
   const [aiLoading, setAiLoading] = useState(false)
+  const [loading, setLoading] = useState(true)
   const [productDesc, setProductDesc] = useState('')
   const [form] = Form.useForm()
+  const [templateForm] = Form.useForm()
 
-  const handleDragEnd = (result: DropResult) => {
-    if (!result.destination) return
+  const loadTemplates = useCallback(async () => {
+    if (!workspace) return
+    const supabase = createClient()
+    const { data } = await supabase
+      .from('checklist_templates')
+      .select('*, checklist_steps(*)')
+      .eq('workspace_id', workspace.id)
+      .order('created_at')
+
+    if (data) {
+      const parsed = data.map((t) => ({
+        ...t,
+        steps: (t.checklist_steps as Step[]).sort((a, b) => a.order - b.order),
+      }))
+      setTemplates(parsed)
+      if (parsed.length > 0 && !selectedTemplate) setSelectedTemplate(parsed[0])
+    }
+    setLoading(false)
+  }, [workspace, selectedTemplate])
+
+  useEffect(() => { loadTemplates() }, [workspace])
+
+  const handleDragEnd = async (result: DropResult) => {
+    if (!result.destination || !selectedTemplate) return
     const steps = [...selectedTemplate.steps]
     const [moved] = steps.splice(result.source.index, 1)
     steps.splice(result.destination.index, 0, moved)
-    const updated = { ...selectedTemplate, steps }
-    setSelectedTemplate(updated)
-    setTemplates((prev) => prev.map((t) => (t.id === updated.id ? updated : t)))
+    const reordered = steps.map((s, i) => ({ ...s, order: i }))
+
+    setSelectedTemplate({ ...selectedTemplate, steps: reordered })
+    setTemplates((prev) => prev.map((t) => t.id === selectedTemplate.id ? { ...t, steps: reordered } : t))
+
+    const supabase = createClient()
+    await Promise.all(reordered.map((s) =>
+      supabase.from('checklist_steps').update({ order: s.order }).eq('id', s.id)
+    ))
   }
 
   const handleAiGenerate = async () => {
     if (!productDesc.trim()) { message.warning('제품 설명을 입력해주세요'); return }
+    if (!selectedTemplate || !workspace) return
     setAiLoading(true)
     try {
       const res = await fetch('/api/generate-checklist', {
@@ -81,16 +94,28 @@ export default function ChecklistsPage() {
         body: JSON.stringify({ description: productDesc }),
       })
       const data = await res.json()
-      const newSteps: Step[] = data.steps.map((s: Omit<Step, 'id'>, i: number) => ({
-        ...s,
-        id: `ai-${Date.now()}-${i}`,
+
+      const supabase = createClient()
+      await supabase.from('checklist_steps').delete().eq('template_id', selectedTemplate.id)
+
+      const stepsToInsert = data.steps.map((s: Omit<Step, 'id' | 'order'>, i: number) => ({
+        template_id: selectedTemplate.id,
+        title: s.title,
+        description: s.description,
+        is_required: s.is_required,
+        order: i,
       }))
-      const updated = { ...selectedTemplate, steps: newSteps }
-      setSelectedTemplate(updated)
-      setTemplates((prev) => prev.map((t) => (t.id === updated.id ? updated : t)))
+      const { data: inserted } = await supabase.from('checklist_steps').insert(stepsToInsert).select()
+
+      if (inserted) {
+        const updated = { ...selectedTemplate, steps: inserted as Step[] }
+        setSelectedTemplate(updated)
+        setTemplates((prev) => prev.map((t) => t.id === updated.id ? updated : t))
+      }
+
       setAiModalOpen(false)
       setProductDesc('')
-      message.success(`${newSteps.length}개의 온보딩 단계가 생성됐습니다!`)
+      message.success(`${data.steps.length}개의 온보딩 단계가 생성됐습니다!`)
     } catch {
       message.error('AI 생성 중 오류가 발생했습니다')
     } finally {
@@ -98,20 +123,56 @@ export default function ChecklistsPage() {
     }
   }
 
-  const handleAddStep = (values: Omit<Step, 'id'>) => {
-    const newStep: Step = { ...values, id: `s-${Date.now()}` }
-    const updated = { ...selectedTemplate, steps: [...selectedTemplate.steps, newStep] }
-    setSelectedTemplate(updated)
-    setTemplates((prev) => prev.map((t) => (t.id === updated.id ? updated : t)))
+  const handleAddTemplate = async (values: { name: string }) => {
+    if (!workspace) return
+    const supabase = createClient()
+    const { data: { user } } = await supabase.auth.getUser()
+    const { data } = await supabase.from('checklist_templates').insert({
+      workspace_id: workspace.id,
+      name: values.name,
+      created_by: user!.id,
+    }).select().single()
+
+    if (data) {
+      const newTemplate = { ...data, steps: [] }
+      setTemplates((prev) => [...prev, newTemplate])
+      setSelectedTemplate(newTemplate)
+    }
+    setAddTemplateModalOpen(false)
+    templateForm.resetFields()
+  }
+
+  const handleAddStep = async (values: Omit<Step, 'id' | 'order'>) => {
+    if (!selectedTemplate) return
+    const supabase = createClient()
+    const { data } = await supabase.from('checklist_steps').insert({
+      template_id: selectedTemplate.id,
+      title: values.title,
+      description: values.description,
+      link_url: values.link_url,
+      is_required: values.is_required ?? true,
+      order: selectedTemplate.steps.length,
+    }).select().single()
+
+    if (data) {
+      const updated = { ...selectedTemplate, steps: [...selectedTemplate.steps, data as Step] }
+      setSelectedTemplate(updated)
+      setTemplates((prev) => prev.map((t) => t.id === updated.id ? updated : t))
+    }
     setAddStepModalOpen(false)
     form.resetFields()
   }
 
-  const handleDeleteStep = (stepId: string) => {
+  const handleDeleteStep = async (stepId: string) => {
+    if (!selectedTemplate) return
+    const supabase = createClient()
+    await supabase.from('checklist_steps').delete().eq('id', stepId)
     const updated = { ...selectedTemplate, steps: selectedTemplate.steps.filter((s) => s.id !== stepId) }
     setSelectedTemplate(updated)
-    setTemplates((prev) => prev.map((t) => (t.id === updated.id ? updated : t)))
+    setTemplates((prev) => prev.map((t) => t.id === updated.id ? updated : t))
   }
+
+  if (loading) return <div className="flex items-center justify-center h-64"><Spin size="large" /></div>
 
   return (
     <div>
@@ -126,6 +187,7 @@ export default function ChecklistsPage() {
             size="large"
             style={{ borderColor: '#6366f1', color: '#6366f1' }}
             onClick={() => setAiModalOpen(true)}
+            disabled={!selectedTemplate}
           >
             AI로 생성
           </Button>
@@ -135,6 +197,7 @@ export default function ChecklistsPage() {
             size="large"
             style={{ background: '#6366f1', borderColor: '#6366f1' }}
             onClick={() => setAddStepModalOpen(true)}
+            disabled={!selectedTemplate}
           >
             단계 추가
           </Button>
@@ -142,21 +205,20 @@ export default function ChecklistsPage() {
       </div>
 
       <div className="flex gap-4">
-        {/* 템플릿 목록 */}
         <div className="w-60 flex-shrink-0 space-y-2">
           {templates.map((t) => (
             <Card
               key={t.id}
               size="small"
               className={`cursor-pointer border transition-all ${
-                selectedTemplate.id === t.id
+                selectedTemplate?.id === t.id
                   ? 'border-indigo-400 bg-indigo-50'
                   : 'border-gray-100 hover:border-indigo-200'
               }`}
               onClick={() => setSelectedTemplate(t)}
             >
               <div className="flex items-center gap-2">
-                <CheckSquareOutlined className={selectedTemplate.id === t.id ? 'text-indigo-500' : 'text-gray-400'} />
+                <CheckSquareOutlined className={selectedTemplate?.id === t.id ? 'text-indigo-500' : 'text-gray-400'} />
                 <div>
                   <p className="text-sm font-medium text-gray-800">{t.name}</p>
                   <p className="text-xs text-gray-400">{t.steps.length}단계</p>
@@ -164,100 +226,72 @@ export default function ChecklistsPage() {
               </div>
             </Card>
           ))}
-          <Button block icon={<PlusOutlined />} type="dashed" className="mt-2">
+          <Button block icon={<PlusOutlined />} type="dashed" className="mt-2" onClick={() => setAddTemplateModalOpen(true)}>
             템플릿 추가
           </Button>
         </div>
 
-        {/* 단계 편집기 */}
         <div className="flex-1">
-          <Card
-            className="border-0 shadow-sm"
-            title={
-              <div className="flex items-center justify-between">
-                <span className="font-semibold text-gray-800">{selectedTemplate.name}</span>
-                <Tag color="purple">{selectedTemplate.steps.length}단계</Tag>
-              </div>
-            }
-          >
-            {selectedTemplate.steps.length === 0 ? (
-              <Empty
-                description="단계가 없습니다. AI로 자동 생성하거나 직접 추가해보세요."
-                image={Empty.PRESENTED_IMAGE_SIMPLE}
-              >
-                <Button
-                  type="primary"
-                  icon={<ThunderboltOutlined />}
-                  style={{ background: '#6366f1', borderColor: '#6366f1' }}
-                  onClick={() => setAiModalOpen(true)}
-                >
-                  AI로 생성하기
+          {!selectedTemplate ? (
+            <Card className="border-0 shadow-sm">
+              <Empty description="템플릿을 선택하거나 새로 만드세요">
+                <Button type="primary" onClick={() => setAddTemplateModalOpen(true)} style={{ background: '#6366f1', borderColor: '#6366f1' }}>
+                  템플릿 만들기
                 </Button>
               </Empty>
-            ) : (
-              <DragStepList
-                steps={selectedTemplate.steps}
-                onDragEnd={handleDragEnd}
-                onDelete={handleDeleteStep}
-              />
-            )}
-          </Card>
+            </Card>
+          ) : (
+            <Card
+              className="border-0 shadow-sm"
+              title={
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-gray-800">{selectedTemplate.name}</span>
+                  <Tag color="purple">{selectedTemplate.steps.length}단계</Tag>
+                </div>
+              }
+            >
+              {selectedTemplate.steps.length === 0 ? (
+                <Empty description="단계가 없습니다. AI로 자동 생성하거나 직접 추가해보세요." image={Empty.PRESENTED_IMAGE_SIMPLE}>
+                  <Button type="primary" icon={<ThunderboltOutlined />} style={{ background: '#6366f1', borderColor: '#6366f1' }} onClick={() => setAiModalOpen(true)}>
+                    AI로 생성하기
+                  </Button>
+                </Empty>
+              ) : (
+                <DragStepList steps={selectedTemplate.steps} onDragEnd={handleDragEnd} onDelete={handleDeleteStep} />
+              )}
+            </Card>
+          )}
         </div>
       </div>
 
       {/* AI 생성 모달 */}
       <Modal
-        title={
-          <div className="flex items-center gap-2">
-            <ThunderboltOutlined className="text-indigo-500" />
-            <span>AI로 온보딩 단계 생성</span>
-          </div>
-        }
+        title={<div className="flex items-center gap-2"><ThunderboltOutlined className="text-indigo-500" /><span>AI로 온보딩 단계 생성</span></div>}
         open={aiModalOpen}
         onCancel={() => { setAiModalOpen(false); setProductDesc('') }}
         footer={null}
       >
         <div className="mt-4">
-          <p className="text-gray-600 text-sm mb-3">
-            제품에 대해 설명해주시면 Claude AI가 최적의 온보딩 단계를 자동으로 만들어드립니다.
-          </p>
-          <TextArea
-            rows={5}
-            placeholder="예: 저희 제품은 팀 프로젝트 관리 SaaS입니다. 할 일 관리, 파일 공유, 팀 채팅 기능을 제공합니다."
-            value={productDesc}
-            onChange={(e) => setProductDesc(e.target.value)}
-            className="mb-4"
-          />
-          <Button
-            type="primary"
-            block
-            size="large"
-            loading={aiLoading}
-            icon={<ThunderboltOutlined />}
-            style={{ background: '#6366f1', borderColor: '#6366f1' }}
-            onClick={handleAiGenerate}
-          >
+          <p className="text-gray-600 text-sm mb-3">제품에 대해 설명해주시면 Claude AI가 최적의 온보딩 단계를 자동으로 만들어드립니다.</p>
+          <TextArea rows={5} placeholder="예: 저희 제품은 팀 프로젝트 관리 SaaS입니다." value={productDesc} onChange={(e) => setProductDesc(e.target.value)} className="mb-4" />
+          <Button type="primary" block size="large" loading={aiLoading} icon={<ThunderboltOutlined />} style={{ background: '#6366f1', borderColor: '#6366f1' }} onClick={handleAiGenerate}>
             {aiLoading ? 'AI가 생성 중...' : 'AI로 생성하기'}
           </Button>
-          {aiLoading && (
-            <div className="text-center mt-4">
-              <Spin />
-              <p className="text-xs text-gray-400 mt-2">Claude AI가 최적의 단계를 분석 중입니다...</p>
-            </div>
-          )}
+          {aiLoading && <div className="text-center mt-4"><Spin /><p className="text-xs text-gray-400 mt-2">Claude AI가 최적의 단계를 분석 중입니다...</p></div>}
         </div>
       </Modal>
 
+      {/* 템플릿 추가 모달 */}
+      <Modal title="새 템플릿 추가" open={addTemplateModalOpen} onCancel={() => { setAddTemplateModalOpen(false); templateForm.resetFields() }} onOk={() => templateForm.submit()} okText="추가" cancelText="취소" okButtonProps={{ style: { background: '#6366f1', borderColor: '#6366f1' } }}>
+        <Form form={templateForm} layout="vertical" className="mt-4" onFinish={handleAddTemplate}>
+          <Form.Item name="name" label="템플릿 이름" rules={[{ required: true }]}>
+            <Input placeholder="예: 기본 온보딩 템플릿" />
+          </Form.Item>
+        </Form>
+      </Modal>
+
       {/* 단계 추가 모달 */}
-      <Modal
-        title="새 단계 추가"
-        open={addStepModalOpen}
-        onCancel={() => { setAddStepModalOpen(false); form.resetFields() }}
-        onOk={() => form.submit()}
-        okText="추가"
-        cancelText="취소"
-        okButtonProps={{ style: { background: '#6366f1', borderColor: '#6366f1' } }}
-      >
+      <Modal title="새 단계 추가" open={addStepModalOpen} onCancel={() => { setAddStepModalOpen(false); form.resetFields() }} onOk={() => form.submit()} okText="추가" cancelText="취소" okButtonProps={{ style: { background: '#6366f1', borderColor: '#6366f1' } }}>
         <Form form={form} layout="vertical" className="mt-4" onFinish={handleAddStep}>
           <Form.Item name="title" label="단계 제목" rules={[{ required: true }]}>
             <Input placeholder="예: 팀원 초대하기" />

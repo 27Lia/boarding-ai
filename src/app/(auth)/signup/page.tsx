@@ -19,20 +19,29 @@ export default function SignupPage() {
   }) => {
     setLoading(true)
     const supabase = createClient()
-    const { error } = await supabase.auth.signUp({
+    const { data, error } = await supabase.auth.signUp({
       email: values.email,
       password: values.password,
       options: {
         data: { name: values.name, company: values.company },
       },
     })
-    setLoading(false)
 
     if (error) {
+      setLoading(false)
       message.error(error.message)
       return
     }
 
+    if (data.user) {
+      await supabase.from('workspaces').insert({
+        name: values.company,
+        owner_id: data.user.id,
+        plan: 'free',
+      })
+    }
+
+    setLoading(false)
     message.success('가입 완료! 이메일 인증 후 로그인해주세요.')
     router.push('/login')
   }
