@@ -33,8 +33,8 @@ export default function SignupPage() {
       return
     }
 
-    message.success('가입 완료! 이메일을 확인해주세요.')
-    router.push('/dashboard')
+    message.success('가입 완료! 이메일 인증 후 로그인해주세요.')
+    router.push('/login')
   }
 
   return (

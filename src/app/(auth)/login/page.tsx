@@ -21,7 +21,11 @@ export default function LoginPage() {
     setLoading(false)
 
     if (error) {
-      message.error('이메일 또는 비밀번호가 올바르지 않습니다.')
+      if (error.code === 'email_not_confirmed') {
+        message.error('이메일 인증이 필요합니다. 가입 시 받은 이메일을 확인해주세요.')
+      } else {
+        message.error('이메일 또는 비밀번호가 올바르지 않습니다.')
+      }
       return
     }
     router.push('/dashboard')
